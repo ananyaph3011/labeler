@@ -2,6 +2,7 @@ import os
 import json
 import zipfile
 import uuid
+from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -18,40 +19,68 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FRONTEND_DIST = os.path.join(BASE_DIR, "dist")
+# ---------------------------------------------------------
+# 1. BULLETPROOF PATH RESOLUTION (Fixes the URI Error)
+# Using pathlib guarantees a strict absolute path on any OS.
+# ---------------------------------------------------------
+BASE_DIR = str(Path(__file__).resolve().parent)
 
+FRONTEND_DIST = os.path.join(BASE_DIR, "dist")
 STORAGE_DIR = os.path.join(BASE_DIR, "storage")
-EXPORTS_DIR = os.path.join(BASE_DIR, "exports") # New folder for compiled ZIPs
+EXPORTS_DIR = os.path.join(BASE_DIR, "exports")
+
 os.makedirs(STORAGE_DIR, exist_ok=True)
 os.makedirs(EXPORTS_DIR, exist_ok=True)
 
-# Dictionary to track background export progress
 export_jobs = {}
 
-# ... (Keep your existing @app.post("/api/save-stage") endpoint exactly the same) ...
+@app.post("/api/save-stage")
+async def save_stage(
+    zip_name: str = Form(...),
+    filename: str = Form(...),
+    boxes: str = Form(...),
+    image: UploadFile = File(...)
+):
+    try:
+        safe_name = "".join([c for c in zip_name if c.isalnum() or c in ('_', '-')]).strip()
+        if not safe_name: safe_name = "default_dataset"
 
-# ---------------------------------------------------------
-# BACKGROUND TASK: Compresses the dataset on the disk, not RAM
-# ---------------------------------------------------------
+        dataset_dir = os.path.join(STORAGE_DIR, safe_name)
+        images_dir = os.path.join(dataset_dir, "images")
+        labels_dir = os.path.join(dataset_dir, "labels")
+        
+        os.makedirs(images_dir, exist_ok=True)
+        os.makedirs(labels_dir, exist_ok=True)
+
+        image_path = os.path.join(images_dir, filename)
+        contents = await image.read()
+        with open(image_path, "wb") as f:
+            f.write(contents)
+
+        base_name = os.path.splitext(filename)[0]
+        label_path = os.path.join(labels_dir, f"{base_name}.json")
+        with open(label_path, "w") as f:
+            f.write(boxes)
+
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 def compile_dataset_task(job_id: str, safe_name: str, export_format: str):
     try:
         dataset_dir = os.path.join(STORAGE_DIR, safe_name)
         images_dir = os.path.join(dataset_dir, "images")
         labels_dir = os.path.join(dataset_dir, "labels")
         
-        # Save directly to disk to save memory and speed up processing
         zip_filepath = os.path.join(EXPORTS_DIR, f"{job_id}.zip")
         
         with zipfile.ZipFile(zip_filepath, 'w', zipfile.ZIP_DEFLATED) as zf:
             image_files = os.listdir(images_dir) if os.path.exists(images_dir) else []
             total_files = len(image_files)
             
-            # Write images
             for i, fname in enumerate(image_files):
                 zf.write(os.path.join(images_dir, fname), f"images/{fname}")
-                # Update progress tracker
-                export_jobs[job_id]["progress"] = int((i / total_files) * 50) 
+                export_jobs[job_id]["progress"] = int((i / total_files) * 50) if total_files > 0 else 50
                 
             label_files = os.listdir(labels_dir) if os.path.exists(labels_dir) else []
             parsed_labels = {}
@@ -66,7 +95,6 @@ def compile_dataset_task(job_id: str, safe_name: str, export_format: str):
             
             class_list = sorted(list(all_classes))
 
-            # YOLO Formatting
             if export_format == "yolo":
                 for i, (l_file, boxes_data) in enumerate(parsed_labels.items()):
                     base_name = os.path.splitext(l_file)[0]
@@ -84,7 +112,6 @@ def compile_dataset_task(job_id: str, safe_name: str, export_format: str):
                 
                 zf.writestr("classes.txt", "\n".join(class_list))
 
-            # COCO Formatting
             else:  
                 coco = {"images": [], "annotations": [], "categories": []}
                 for i, cls_name in enumerate(class_list):
@@ -120,7 +147,6 @@ def compile_dataset_task(job_id: str, safe_name: str, export_format: str):
         export_jobs[job_id]["error"] = str(e)
 
 
-# 1. Trigger the export (Fast, no timeout)
 @app.post("/api/request-export")
 async def request_export(
     background_tasks: BackgroundTasks,
@@ -136,13 +162,10 @@ async def request_export(
     job_id = str(uuid.uuid4())
     export_jobs[job_id] = {"status": "processing", "progress": 0}
     
-    # Hand off the heavy lifting to the background thread
     background_tasks.add_task(compile_dataset_task, job_id, safe_name, format)
-    
     return {"job_id": job_id}
 
 
-# 2. Check the progress
 @app.get("/api/export-status/{job_id}")
 async def check_export_status(job_id: str):
     if job_id not in export_jobs:
@@ -150,15 +173,21 @@ async def check_export_status(job_id: str):
     return export_jobs[job_id]
 
 
-# 3. Download the final compiled file from disk
 @app.get("/api/download/{job_id}/{filename}")
 async def download_export(job_id: str, filename: str):
     file_path = os.path.join(EXPORTS_DIR, f"{job_id}.zip")
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
-    
-    # FileResponse handles massive files efficiently without buffering into RAM
     return FileResponse(file_path, media_type="application/x-zip-compressed", filename=filename)
 
 
-# ... (Keep your existing static file serving setup at the bottom) ...
+# ---------------------------------------------------------
+# 2. UI MOUNTING (MUST BE AT THE VERY BOTTOM)
+# ---------------------------------------------------------
+if os.path.exists(FRONTEND_DIST):
+    # Forced string casting ensures FastAPI never gets an empty/invalid object
+    app.mount("/", StaticFiles(directory=str(FRONTEND_DIST), html=True), name="ui")
+else:
+    @app.get("/")
+    def fallback():
+        return {"error": f"The compiled frontend was not found at {FRONTEND_DIST}. Ensure 'dist' is uploaded to GitHub."}

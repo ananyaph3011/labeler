@@ -7,7 +7,6 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTa
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List
 
 app = FastAPI()
 
@@ -28,6 +27,7 @@ os.makedirs(STORAGE_DIR, exist_ok=True)
 os.makedirs(EXPORTS_DIR, exist_ok=True)
 
 export_jobs = {}
+VALID_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp')
 
 @app.post("/api/save-stage")
 async def save_stage(
@@ -38,7 +38,6 @@ async def save_stage(
     image: UploadFile = File(...)
 ):
     try:
-        # FIX: Isolate directories by session_id, NOT zip_name, to prevent data mixing
         dataset_dir = os.path.join(STORAGE_DIR, session_id)
         images_dir = os.path.join(dataset_dir, "images")
         labels_dir = os.path.join(dataset_dir, "labels")
@@ -70,11 +69,15 @@ def compile_dataset_task(job_id: str, session_id: str, safe_zip_name: str, expor
         
         with zipfile.ZipFile(zip_filepath, 'w', zipfile.ZIP_DEFLATED) as zf:
             
-            # FIX: We now base everything STRICTLY on the images present. 
-            image_files = os.listdir(images_dir) if os.path.exists(images_dir) else []
+            # FIX 1: Strictly filter out non-image files (like .DS_Store) and sort deterministically
+            if os.path.exists(images_dir):
+                raw_files = os.listdir(images_dir)
+                image_files = sorted([f for f in raw_files if f.lower().endswith(VALID_EXTENSIONS)])
+            else:
+                image_files = []
+                
             total_files = len(image_files)
             
-            # 1. First Pass: Read all JSONs to gather a universal Class List
             parsed_labels = {}
             all_classes = set()
             if os.path.exists(labels_dir):
@@ -83,12 +86,11 @@ def compile_dataset_task(job_id: str, session_id: str, safe_zip_name: str, expor
                         data = json.load(f)
                         parsed_labels[l_file] = data
                         for b in data:
-                            if "isEmpty" not in b: # ignore empty dummy boxes from sync
+                            if "isEmpty" not in b: 
                                 all_classes.add(b["className"])
             
             class_list = sorted(list(all_classes))
 
-            # 2. Second Pass: Write out strictly 1-to-1 matched files
             if export_format == "yolo":
                 for i, fname in enumerate(image_files):
                     base_name = os.path.splitext(fname)[0]
@@ -106,27 +108,26 @@ def compile_dataset_task(job_id: str, session_id: str, safe_zip_name: str, expor
                             norm_h = b["h"] / b["imgH"]
                             yolo_lines.append(f"{cat_id} {x_center:.6f} {y_center:.6f} {norm_w:.6f} {norm_h:.6f}")
                     
-                    # This guarantees an empty .txt file is written even if there are no annotations
                     zf.writestr(f"{safe_zip_name}/labels/{base_name}.txt", "\n".join(yolo_lines))
-                    export_jobs[job_id]["progress"] = int((i / total_files) * 90)
+                    if total_files > 0:
+                        export_jobs[job_id]["progress"] = int((i / total_files) * 90)
                 
                 zf.writestr(f"{safe_zip_name}/classes.txt", "\n".join(class_list))
 
             else:  
-                # COCO Format 1-to-1 strict mapping
+                # FIX 2: COCO strictly requires IDs to start at 1, not 0.
                 coco = {"images": [], "annotations": [], "categories": []}
-                for i, cls_name in enumerate(class_list):
+                for i, cls_name in enumerate(class_list, start=1):
                     coco["categories"].append({"id": i, "name": cls_name, "supercategory": "none"})
 
                 anno_id = 1
-                for img_id, fname in enumerate(image_files):
+                for img_id, fname in enumerate(image_files, start=1):
                     base_name = os.path.splitext(fname)[0]
                     zf.write(os.path.join(images_dir, fname), f"{safe_zip_name}/images/{fname}")
                     
                     boxes_data = parsed_labels.get(f"{base_name}.json", [])
+                    img_w, img_h = 800, 600
                     
-                    # Extract dimensions (from dummy payload or real boxes)
-                    img_w, img_h = 800, 600 # default fallback
                     if boxes_data and len(boxes_data) > 0:
                         img_w = boxes_data[0].get("imgW", 800)
                         img_h = boxes_data[0].get("imgH", 600)
@@ -135,7 +136,7 @@ def compile_dataset_task(job_id: str, session_id: str, safe_zip_name: str, expor
 
                     for b in boxes_data:
                         if "isEmpty" not in b:
-                            cat_id = class_list.index(b["className"])
+                            cat_id = class_list.index(b["className"]) + 1  # Map to the 1-indexed category
                             coco["annotations"].append({
                                 "id": anno_id, "image_id": img_id, "category_id": cat_id,
                                 "bbox": [b["x"], b["y"], b["w"], b["h"]], "area": b["w"] * b["h"],
@@ -143,7 +144,8 @@ def compile_dataset_task(job_id: str, session_id: str, safe_zip_name: str, expor
                             })
                             anno_id += 1
                             
-                    export_jobs[job_id]["progress"] = int((img_id / total_files) * 90)
+                    if total_files > 0:
+                        export_jobs[job_id]["progress"] = int((img_id / total_files) * 90)
                 
                 zf.writestr(f"{safe_zip_name}/annotations.json", json.dumps(coco, indent=2))
 
@@ -191,9 +193,11 @@ async def download_export(job_id: str, filename: str):
 # ---------------------------------------------------------
 # UI MOUNTING
 # ---------------------------------------------------------
-if os.path.exists(FRONTEND_DIST):
+# If the dist folder is missing/empty, it will safely show this API message
+# instead of crashing with a Not Found error.
+if os.path.exists(FRONTEND_DIST) and os.path.exists(os.path.join(FRONTEND_DIST, "index.html")):
     app.mount("/", StaticFiles(directory=str(FRONTEND_DIST), html=True), name="ui")
 else:
     @app.get("/")
     def fallback():
-        return {"error": f"The compiled frontend was not found at {FRONTEND_DIST}. Ensure 'dist' is uploaded to GitHub."}
+        return {"status": "API is active", "message": "Frontend static files not found, but backend is ready to accept requests from localhost."}
